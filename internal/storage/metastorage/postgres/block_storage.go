@@ -127,6 +127,9 @@ func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api
 
 func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, height uint64, blockHash string) (*api.BlockMetadata, error) {
 	return b.instrumentGetBlockByHash.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
+		if err := b.validateHeight(height); err != nil {
+			return nil, err
+		}
 		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height = $2 AND hash = $3"
 		row := b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		block, err := model.BlockMetadataFromRow(row)
@@ -139,6 +142,9 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 
 func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, height uint64) (*api.BlockMetadata, error) {
 	return b.instrumentGetBlockByHeight.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
+		if err := b.validateHeight(height); err != nil {
+			return nil, err
+		}
 		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height = $2"
 		row := b.db.QueryRowContext(ctx, query, tag, height)
 		block, err := model.BlockMetadataFromRow(row)
@@ -151,6 +157,9 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 
 func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) ([]*api.BlockMetadata, error) {
 	return b.instrumentGetBlocksByHeightRange.Instrument(ctx, func(ctx context.Context) ([]*api.BlockMetadata, error) {
+		if err := b.validateHeight(startHeight); err != nil {
+			return nil, err
+		}
 		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height >= $2 AND height < $3 ORDER BY height"
 		rows, err := b.db.QueryContext(ctx, query, tag, startHeight, endHeight)
 		if err != nil {
@@ -168,6 +177,12 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 
 func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
 	return b.instrumentGetBlocksByHeights.Instrument(ctx, func(ctx context.Context) ([]*api.BlockMetadata, error) {
+		for _, height := range heights {
+			if err := b.validateHeight(height); err != nil {
+				return nil, err
+			}
+		}
+
 		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height IN ($2)"
 		rows, err := b.db.QueryContext(ctx, query, tag, heights)
 		if err != nil {
