@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
+	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
@@ -179,4 +180,12 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 		}
 		return blocks, nil
 	})
+}
+
+func (b *blockStorageImpl) validateHeight (height uint64) error {
+	if height < b.blockStartHeight {
+		return xerrors.Errorf("height(%d) should be no less than blockStartHeight(%d): %w",
+			height, b.blockStartHeight, errors.ErrInvalidHeight)
+	}
+	return nil
 }
