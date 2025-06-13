@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
@@ -12,6 +14,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
+	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/xerrors"
 )
 
@@ -47,78 +50,164 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 
 func (b *blockStorageImpl) PersistBlockMetas(
 	ctx context.Context, updateWatermark bool, blocks []*api.BlockMetadata, lastBlock *api.BlockMetadata) error {
-	//TODO: watermark update
 	return b.instrumentPersistBlockMetas.Instrument(ctx, func(ctx context.Context) error {
 		if len(blocks) == 0 {
 			return nil
-		} else {
-			if len(blocks) == 0 {
-				return nil
-			}
-			sort.Slice(blocks, func(i, j int) bool { return blocks[i].Height < blocks[j].Height }) //sort blocks by height
-			if err := parser.ValidateChain(blocks, lastBlock); err != nil {                        //validate chain
-				return xerrors.Errorf("failed to validate chain: %w", err)
-			}
-			transaction, err := b.db.BeginTx(ctx, nil) //start transaction
-			if err != nil {
-				return xerrors.Errorf("transaction failed to start: %w", err)
-			}
-			committed := false
-			defer func() {
-				if !committed {
-					transaction.Rollback()
-				}
-			}()
-
-			query := `INSERT INTO blocks (tag, hash, parent_hash, height, object_key_main, parent_height, timestamp, skipped, is_canonical) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (height, hash) DO UPDATE SET
-			tag = EXCLUDED.tag,
-			parent_hash = EXCLUDED.parent_hash,
-			object_key_main = EXCLUDED.object_key_main,
-			parent_height = EXCLUDED.parent_height,
-			timestamp = EXCLUDED.timestamp,
-			skipped = EXCLUDED.skipped,
-			is_canonical = EXCLUDED.is_canonical`
-
-			statement, err := transaction.PrepareContext(ctx, query)
-			if err != nil {
-				return xerrors.Errorf("failed to prepare statement: %w", err)
-			}
-			defer statement.Close()
-
-			for _, block := range blocks {
-				_, err := statement.ExecContext(ctx,
-					block.Tag,
-					block.Hash,
-					block.ParentHash,
-					block.Height,
-					block.ObjectKeyMain,
-					block.ParentHeight,
-					block.GetTimestamp().GetSeconds(),
-					block.Skipped,
-					true)
-				if err != nil {
-					return xerrors.Errorf("failed to execute statement: %w", err)
-				}
-			}
-			err = transaction.Commit()
-			if err != nil {
-				return xerrors.Errorf("failed to commit transaction: %w", err)
-			}
-			committed = true
-			fmt.Printf("DEBUG: Successfully committed %d blocks to database\n", len(blocks))
-			return nil
 		}
+
+		// Sort blocks by height for chain validation
+		sort.Slice(blocks, func(i, j int) bool {
+			return blocks[i].Height < blocks[j].Height
+		})
+
+		// Validate chain integrity
+		if err := parser.ValidateChain(blocks, lastBlock); err != nil {
+			return xerrors.Errorf("failed to validate chain: %w", err)
+		}
+
+		// Start transaction for atomic updates
+		tx, err := b.db.BeginTx(ctx, nil)
+		if err != nil {
+			return xerrors.Errorf("failed to begin transaction: %w", err)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				tx.Rollback()
+			}
+		}()
+
+		// Step 1: Insert all blocks into block_metadata table (append-only)
+		blockMetadataQuery := `
+			INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tag, hash) DO UPDATE SET
+				height = EXCLUDED.height,
+				parent_hash = EXCLUDED.parent_hash,
+				object_key_main = EXCLUDED.object_key_main,
+				timestamp = EXCLUDED.timestamp,
+				skipped = EXCLUDED.skipped
+			RETURNING id`
+
+		var blockIds []int64
+		for _, block := range blocks {
+			tsProto := block.GetTimestamp()
+			var goTime time.Time
+			if tsProto == nil {
+				goTime = time.Unix(0, 0)
+			} else {
+				goTime, err = ptypes.Timestamp(tsProto)
+				if err != nil {
+					return xerrors.Errorf("invalid block timestamp at height %d: %w", block.Height, err)
+				}
+			}
+			var blockId int64
+			err = tx.QueryRowContext(ctx, blockMetadataQuery,
+				block.Height,
+				block.Tag,
+				block.Hash,
+				block.ParentHash,
+				block.ObjectKeyMain,
+				goTime,
+				block.Skipped,
+			).Scan(&blockId)
+			if err != nil {
+				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
+			}
+			blockIds = append(blockIds, blockId)
+		}
+
+		// Step 2: Handle canonical block updates
+		if len(blocks) > 0 {
+			tag := blocks[0].Tag
+
+			// Insert canonical block entries for each new block
+			canonicalQuery := `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag, sequence_number)
+				VALUES ($1, $2, $3, $4)
+				ON CONFLICT (height, tag, block_metadata_id) DO NOTHING`
+
+			if updateWatermark {
+				// Normal case: advance the watermark (use positive sequence numbers)
+				// Get the current max sequence number for this tag
+				var maxSequence int64
+				sequenceQuery := `
+					SELECT COALESCE(MAX(sequence_number), -1) 
+					FROM canonical_blocks 
+					WHERE tag = $1`
+				err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&maxSequence)
+				if err != nil {
+					return xerrors.Errorf("failed to get max sequence number: %w", err)
+				}
+
+				for i, block := range blocks {
+					newSequence := maxSequence + 1 + int64(i)
+					_, err = tx.ExecContext(ctx, canonicalQuery,
+						block.Height,
+						blockIds[i],
+						tag,
+						newSequence,
+					)
+					if err != nil {
+						return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
+					}
+				}
+			} else {
+				// Replication/backfill case: don't advance watermark (use negative sequence numbers)
+				// Get the current min negative sequence number
+				var minSequence int64
+				sequenceQuery := `
+					SELECT COALESCE(MIN(sequence_number), 0) 
+					FROM canonical_blocks 
+					WHERE tag = $1 AND sequence_number < 0`
+				err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&minSequence)
+				if err != nil {
+					return xerrors.Errorf("failed to get min sequence number: %w", err)
+				}
+
+				for i, block := range blocks {
+					newSequence := minSequence - 1 - int64(i)
+					_, err := tx.ExecContext(ctx, canonicalQuery,
+						block.Height,
+						blockIds[i],
+						tag,
+						newSequence,
+					)
+					if err != nil {
+						return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
+					}
+				}
+			}
+		}
+
+		// Commit transaction
+		err = tx.Commit()
+		if err != nil {
+			return xerrors.Errorf("failed to commit transaction: %w", err)
+		}
+		committed = true
+
+		return nil
 	})
 }
 
 func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api.BlockMetadata, error) {
 	return b.instrumentGetLatestBlock.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
-		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 ORDER BY height DESC LIMIT 1"
+		// Get the latest canonical block by max positive sequence_number (watermark)
+		query := `
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+			WHERE cb.tag = $1 AND cb.sequence_number > 0
+			ORDER BY cb.sequence_number DESC
+			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag)
-		block, err := model.BlockMetadataFromRow(row)
+		block, err := model.BlockMetadataFromCanonicalRow(row)
 		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, xerrors.Errorf("no latest block found: %w", errors.ErrItemNotFound)
+			}
 			return nil, xerrors.Errorf("failed to get latest block: %w", err)
 		}
 		return block, nil
@@ -130,10 +219,18 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 		if err := b.validateHeight(height); err != nil {
 			return nil, err
 		}
-		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height = $2 AND hash = $3"
+		// Query block_metadata directly by hash (may not be canonical)
+		query := `
+			SELECT id, height, tag, hash, parent_hash, object_key_main, 
+			       EXTRACT(EPOCH FROM timestamp)::BIGINT, skipped
+			FROM block_metadata 
+			WHERE tag = $1 AND height = $2 AND hash = $3`
 		row := b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		block, err := model.BlockMetadataFromRow(row)
 		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, xerrors.Errorf("block not found: %w", errors.ErrItemNotFound)
+			}
 			return nil, xerrors.Errorf("failed to get block by hash: %w", err)
 		}
 		return block, nil
@@ -145,10 +242,21 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 		if err := b.validateHeight(height); err != nil {
 			return nil, err
 		}
-		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height = $2"
+		// Get the canonical block at this height
+		query := `
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+			WHERE cb.tag = $1 AND cb.height = $2
+			ORDER BY cb.sequence_number DESC
+			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag, height)
-		block, err := model.BlockMetadataFromRow(row)
+		block, err := model.BlockMetadataFromCanonicalRow(row)
 		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, xerrors.Errorf("canonical block at height %d not found: %w", height, errors.ErrItemNotFound)
+			}
 			return nil, xerrors.Errorf("failed to get block by height: %w", err)
 		}
 		return block, nil
@@ -160,17 +268,32 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		if err := b.validateHeight(startHeight); err != nil {
 			return nil, err
 		}
-		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height >= $2 AND height < $3 ORDER BY height"
+		// Get canonical blocks in the height range
+		query := `
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+			WHERE cb.tag = $1 AND cb.height >= $2 AND cb.height < $3
+			ORDER BY cb.height ASC`
 		rows, err := b.db.QueryContext(ctx, query, tag, startHeight, endHeight)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by height range: %w", err)
 		}
 		defer rows.Close()
 
-		blocks, err := model.BlockMetadataFromRows(rows)
+		blocks, err := model.BlockMetadataFromCanonicalRows(rows)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to scan block row: %w", err)
+			return nil, xerrors.Errorf("failed to scan block rows: %w", err)
 		}
+
+		// Check if we have gaps in the range (missing canonical blocks)
+		expectedCount := int(endHeight - startHeight)
+		if len(blocks) != expectedCount {
+			return nil, xerrors.Errorf("missing canonical blocks in range [%d, %d): expected %d, got %d: %w",
+				startHeight, endHeight, expectedCount, len(blocks), errors.ErrItemNotFound)
+		}
+
 		return blocks, nil
 	})
 }
@@ -183,21 +306,60 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 			}
 		}
 
-		query := "SELECT height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped, is_canonical FROM blocks WHERE tag = $1 AND height IN ($2)"
-		rows, err := b.db.QueryContext(ctx, query, tag, heights)
+		if len(heights) == 0 {
+			return []*api.BlockMetadata{}, nil
+		}
+
+		// Build dynamic query with placeholders for IN clause
+		placeholders := make([]string, len(heights))
+		args := make([]interface{}, len(heights)+1)
+		args[0] = tag // First argument is tag
+
+		for i, height := range heights {
+			placeholders[i] = fmt.Sprintf("$%d", i+2) // Start from $2 since $1 is tag
+			args[i+1] = height
+		}
+
+		query := fmt.Sprintf(`
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+			WHERE cb.tag = $1 AND cb.height IN (%s)
+			ORDER BY cb.height ASC`,
+			strings.Join(placeholders, ", "))
+
+		rows, err := b.db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by heights: %w", err)
 		}
 		defer rows.Close()
-		blocks, err := model.BlockMetadataFromRows(rows)
+
+		blocks, err := model.BlockMetadataFromCanonicalRows(rows)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to scan block row: %w", err)
+			return nil, xerrors.Errorf("failed to scan block rows: %w", err)
 		}
-		return blocks, nil
+
+		// Verify we got all requested blocks and return them in the same order as requested
+		blockMap := make(map[uint64]*api.BlockMetadata)
+		for _, block := range blocks {
+			blockMap[block.Height] = block
+		}
+
+		orderedBlocks := make([]*api.BlockMetadata, len(heights))
+		for i, height := range heights {
+			block, exists := blockMap[height]
+			if !exists {
+				return nil, xerrors.Errorf("canonical block at height %d not found: %w", height, errors.ErrItemNotFound)
+			}
+			orderedBlocks[i] = block
+		}
+
+		return orderedBlocks, nil
 	})
 }
 
-func (b *blockStorageImpl) validateHeight (height uint64) error {
+func (b *blockStorageImpl) validateHeight(height uint64) error {
 	if height < b.blockStartHeight {
 		return xerrors.Errorf("height(%d) should be no less than blockStartHeight(%d): %w",
 			height, b.blockStartHeight, errors.ErrInvalidHeight)
