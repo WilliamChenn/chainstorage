@@ -26,11 +26,11 @@ type (
 )
 
 func NewMetaStorage(params Params) (internal.Result, error) {
+	//todo: add implementation for creating db for specific chain
 	db, err := newDBConnection(context.Background(), &params.Config.AWS.Postgres)
 	if err != nil {
 		return internal.Result{}, err
 	}
-
 	// Create storage implementations with database connection
 	blockStorage, err := newBlockStorage(db, params)
 	if err != nil {

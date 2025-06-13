@@ -29,9 +29,9 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 	if err := db.PingContext(ctx); err != nil {
 		return nil, xerrors.Errorf("failed to ping database: %w", err)
 	}
-	if err := applySchema(ctx, db); err != nil {
-		return nil, xerrors.Errorf("failed to apply schema: %w", err)
+	// Run database migrations
+	if err := runMigrations(ctx, db); err != nil {
+		return nil, xerrors.Errorf("failed to run migrations: %w", err)
 	}
-
 	return db, nil
 }
