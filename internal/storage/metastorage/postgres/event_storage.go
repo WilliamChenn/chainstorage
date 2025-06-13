@@ -71,7 +71,6 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 	if len(eventEntries) == 0 {
 		return nil
 	}
-
 	return e.instrumentAddEvents.Instrument(ctx, func(ctx context.Context) error {
 		tx, err := e.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -176,13 +175,11 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if err != nil {
 			return nil, err
 		}
-
 		// Validate that we have all events in the range
 		expectedCount := maxEventId - minEventId
 		if int64(len(events)) != expectedCount {
 			return nil, errors.ErrItemNotFound
 		}
-
 		return events, nil
 	})
 }
@@ -207,6 +204,7 @@ func (e *eventStorageImpl) GetMaxEventId(ctx context.Context, eventTag uint32) (
 	})
 }
 
+// basically if we have events 1,2,3,4,5,6,7 and call SetMaxEventId(ctx, eventTag, 4), then we will delete all events after 4
 func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, maxEventId int64) error {
 	return e.instrumentSetMaxEventId.Instrument(ctx, func(ctx context.Context) error {
 		if maxEventId < model.EventIdStartValue && maxEventId != model.EventIdDeleted {
@@ -239,7 +237,6 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 			if !exists {
 				return xerrors.Errorf("event entry with max event id %d does not exist", maxEventId)
 			}
-
 			// Delete events beyond the max event ID
 			_, err = tx.ExecContext(ctx, `
 				DELETE FROM block_events WHERE event_tag = $1 AND event_sequence > $2
@@ -304,7 +301,6 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 }
 
 // Helper functions
-
 func (e *eventStorageImpl) getBlockMetadata(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
 	var blockMetadataId int64
 	err := tx.QueryRowContext(ctx, `
