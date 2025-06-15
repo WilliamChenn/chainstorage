@@ -54,18 +54,13 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		if len(blocks) == 0 {
 			return nil
 		}
-
 		// Sort blocks by height for chain validation
 		sort.Slice(blocks, func(i, j int) bool {
 			return blocks[i].Height < blocks[j].Height
 		})
-
-		// Validate chain integrity
 		if err := parser.ValidateChain(blocks, lastBlock); err != nil {
 			return xerrors.Errorf("failed to validate chain: %w", err)
 		}
-
-		// Start transaction for atomic updates
 		tx, err := b.db.BeginTx(ctx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to begin transaction: %w", err)
@@ -76,8 +71,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				tx.Rollback()
 			}
 		}()
-
-		// Step 1: Insert all blocks into block_metadata table (append-only)
+		//insert all blocks into block_metadata table (append-only)
 		blockMetadataQuery := `
 			INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -93,10 +87,10 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		for _, block := range blocks {
 			tsProto := block.GetTimestamp()
 			var goTime time.Time
-			if tsProto == nil {
+			if tsProto == nil { //special case for genesis block
 				goTime = time.Unix(0, 0)
 			} else {
-				goTime, err = ptypes.Timestamp(tsProto)
+				goTime, err = ptypes.Timestamp(tsProto) //convert timestamp to time.Time
 				if err != nil {
 					return xerrors.Errorf("invalid block timestamp at height %d: %w", block.Height, err)
 				}
@@ -117,65 +111,34 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			blockIds = append(blockIds, blockId)
 		}
 
-		// Step 2: Handle canonical block updates
+		//Handle canonical block updates
+		//TODO: handle watermark update
 		if len(blocks) > 0 {
 			tag := blocks[0].Tag
-
 			// Insert canonical block entries for each new block
 			canonicalQuery := `
 				INSERT INTO canonical_blocks (height, block_metadata_id, tag, sequence_number)
 				VALUES ($1, $2, $3, $4)
 				ON CONFLICT (height, tag, block_metadata_id) DO NOTHING`
-
-			if updateWatermark {
-				// Normal case: advance the watermark (use positive sequence numbers)
-				// Get the current max sequence number for this tag
-				var maxSequence int64
-				sequenceQuery := `
+			var maxSequence int64
+			sequenceQuery := `
 					SELECT COALESCE(MAX(sequence_number), -1) 
 					FROM canonical_blocks 
 					WHERE tag = $1`
-				err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&maxSequence)
+			err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&maxSequence)
+			if err != nil {
+				return xerrors.Errorf("failed to get max sequence number: %w", err)
+			}
+			for i, block := range blocks {
+				newSequence := maxSequence + 1 + int64(i)
+				_, err = tx.ExecContext(ctx, canonicalQuery,
+					block.Height,
+					blockIds[i],
+					tag,
+					newSequence,
+				)
 				if err != nil {
-					return xerrors.Errorf("failed to get max sequence number: %w", err)
-				}
-
-				for i, block := range blocks {
-					newSequence := maxSequence + 1 + int64(i)
-					_, err = tx.ExecContext(ctx, canonicalQuery,
-						block.Height,
-						blockIds[i],
-						tag,
-						newSequence,
-					)
-					if err != nil {
-						return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
-					}
-				}
-			} else {
-				// Replication/backfill case: don't advance watermark (use negative sequence numbers)
-				// Get the current min negative sequence number
-				var minSequence int64
-				sequenceQuery := `
-					SELECT COALESCE(MIN(sequence_number), 0) 
-					FROM canonical_blocks 
-					WHERE tag = $1 AND sequence_number < 0`
-				err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&minSequence)
-				if err != nil {
-					return xerrors.Errorf("failed to get min sequence number: %w", err)
-				}
-
-				for i, block := range blocks {
-					newSequence := minSequence - 1 - int64(i)
-					_, err := tx.ExecContext(ctx, canonicalQuery,
-						block.Height,
-						blockIds[i],
-						tag,
-						newSequence,
-					)
-					if err != nil {
-						return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
-					}
+					return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
 				}
 			}
 		}
