@@ -42,12 +42,11 @@ func BlockMetadataFromRow(row *sql.Row) (*api.BlockMetadata, error) {
 
 // BlockMetadataFromCanonicalRow converts a postgres row from canonical join into a BlockMetadata proto
 // Used for queries that join canonical_blocks with block_metadata
-// Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, bm.timestamp, bm.skipped, cb.sequence_number
+// Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, bm.timestamp, bm.skipped
 func BlockMetadataFromCanonicalRow(row *sql.Row) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
-	var id int64             // block_metadata.id
-	var sequenceNumber int64 // canonical_blocks.sequence_number
+	var id int64 // block_metadata.id
 	err := row.Scan(
 		&id,
 		&block.Height,
@@ -57,7 +56,6 @@ func BlockMetadataFromCanonicalRow(row *sql.Row) (*api.BlockMetadata, error) {
 		&block.ObjectKeyMain,
 		&timestamp,
 		&block.Skipped,
-		&sequenceNumber,
 	)
 	if err != nil {
 		return nil, err
@@ -102,8 +100,7 @@ func BlockMetadataFromCanonicalRows(rows *sql.Rows) ([]*api.BlockMetadata, error
 	for rows.Next() {
 		var block api.BlockMetadata
 		var timestamp int64
-		var id int64
-		var sequenceNumber int64
+		var id int64 // block_metadata.id
 		err := rows.Scan(
 			&id,
 			&block.Height,
@@ -113,7 +110,6 @@ func BlockMetadataFromCanonicalRows(rows *sql.Rows) ([]*api.BlockMetadata, error
 			&block.ObjectKeyMain,
 			&timestamp,
 			&block.Skipped,
-			&sequenceNumber,
 		)
 		if err != nil {
 			return nil, err

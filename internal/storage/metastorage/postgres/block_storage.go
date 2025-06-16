@@ -71,7 +71,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				tx.Rollback()
 			}
 		}()
-		//insert all blocks into block_metadata table (append-only)
+		//insert all blocks into block_metadata table (append-only) and canonical_blocks table
 		blockMetadataQuery := `
 			INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -82,8 +82,11 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped
 			RETURNING id`
-
-		var blockIds []int64
+		canonicalQuery := `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (height, tag) DO UPDATE
+			SET block_metadata_id = EXCLUDED.block_metadata_id`
 		for _, block := range blocks {
 			tsProto := block.GetTimestamp()
 			var goTime time.Time
@@ -108,63 +111,38 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			if err != nil {
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
 			}
-			blockIds = append(blockIds, blockId)
-		}
-
-		//Handle canonical block updates
-		//TODO: handle watermark update
-		if len(blocks) > 0 {
-			tag := blocks[0].Tag
-			// Insert canonical block entries for each new block
-			canonicalQuery := `
-				INSERT INTO canonical_blocks (height, block_metadata_id, tag, sequence_number)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (height, tag, block_metadata_id) DO NOTHING`
-			var maxSequence int64
-			sequenceQuery := `
-					SELECT COALESCE(MAX(sequence_number), -1) 
-					FROM canonical_blocks 
-					WHERE tag = $1`
-			err := tx.QueryRowContext(ctx, sequenceQuery, tag).Scan(&maxSequence)
+			_, err = tx.ExecContext(ctx, canonicalQuery,
+				block.Height,
+				blockId,
+				block.Tag,
+			)
 			if err != nil {
-				return xerrors.Errorf("failed to get max sequence number: %w", err)
-			}
-			for i, block := range blocks {
-				newSequence := maxSequence + 1 + int64(i)
-				_, err = tx.ExecContext(ctx, canonicalQuery,
-					block.Height,
-					blockIds[i],
-					tag,
-					newSequence,
-				)
-				if err != nil {
-					return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
-				}
+				return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
 			}
 		}
-
 		// Commit transaction
 		err = tx.Commit()
 		if err != nil {
 			return xerrors.Errorf("failed to commit transaction: %w", err)
 		}
 		committed = true
-
+		// `updateWatermark` is ignored in Postgres implementation because we can always find the latest
+		// block by querying the maximum height in canonical_blocks for a tag.
+		//For each new block we simply
+		// insert or update the canonical_blocks row at its height.
 		return nil
 	})
 }
 
 func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api.BlockMetadata, error) {
 	return b.instrumentGetLatestBlock.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
-		// Get the latest canonical block by max positive sequence_number (watermark)
+		// Get the latest canonical block by highest height
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
-			WHERE cb.tag = $1 AND cb.sequence_number > 0
-			ORDER BY cb.sequence_number DESC
-			LIMIT 1`
+			WHERE cb.tag = $1`
 		row := b.db.QueryRowContext(ctx, query, tag)
 		block, err := model.BlockMetadataFromCanonicalRow(row)
 		if err != nil {
@@ -208,11 +186,10 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 		// Get the canonical block at this height
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height = $2
-			ORDER BY cb.sequence_number DESC
 			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag, height)
 		block, err := model.BlockMetadataFromCanonicalRow(row)
@@ -234,7 +211,7 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		// Get canonical blocks in the height range
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height >= $2 AND cb.height < $3
@@ -268,24 +245,20 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 				return nil, err
 			}
 		}
-
 		if len(heights) == 0 {
 			return []*api.BlockMetadata{}, nil
 		}
-
 		// Build dynamic query with placeholders for IN clause
 		placeholders := make([]string, len(heights))
 		args := make([]interface{}, len(heights)+1)
 		args[0] = tag // First argument is tag
-
 		for i, height := range heights {
 			placeholders[i] = fmt.Sprintf("$%d", i+2) // Start from $2 since $1 is tag
 			args[i+1] = height
 		}
-
 		query := fmt.Sprintf(`
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped, cb.sequence_number
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height IN (%s)

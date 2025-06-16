@@ -49,7 +49,6 @@ func (e *eventStorageImpl) AddEvents(ctx context.Context, eventTag uint32, event
 	if len(events) == 0 {
 		return nil
 	}
-
 	return e.instrumentAddEvents.Instrument(ctx, func(ctx context.Context) error {
 		maxEventId, err := e.GetMaxEventId(ctx, eventTag)
 		var startEventId int64
@@ -77,10 +76,9 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
 		defer tx.Rollback()
-
 		//get or block_metadata entries for each event
 		for _, eventEntry := range eventEntries {
-			blockMetadataId, err := e.getBlockMetadata(ctx, tx, eventEntry)
+			blockMetadataId, err := e.getBlockMetadataId(ctx, tx, eventEntry)
 			if err != nil {
 				return xerrors.Errorf("failed to get block metadata: %w", err)
 			}
@@ -187,22 +185,19 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 func (e *eventStorageImpl) GetMaxEventId(ctx context.Context, eventTag uint32) (int64, error) {
 	return e.instrumentGetMaxEventId.Instrument(ctx, func(ctx context.Context) (int64, error) {
 		var maxEventId sql.NullInt64
-
 		err := e.db.QueryRowContext(ctx, `
 			SELECT MAX(event_sequence) FROM block_events WHERE event_tag = $1 
 		`, eventTag).Scan(&maxEventId) //watermark
-
 		if err != nil {
 			return 0, xerrors.Errorf("failed to get max event id: %w", err)
 		}
-
 		if !maxEventId.Valid {
 			return 0, errors.ErrNoEventHistory
 		}
-
 		return maxEventId.Int64, nil
 	})
 }
+
 
 // basically if we have events 1,2,3,4,5,6,7 and call SetMaxEventId(ctx, eventTag, 4), then we will delete all events after 4
 func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, maxEventId int64) error {
@@ -301,7 +296,7 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 }
 
 // Helper functions
-func (e *eventStorageImpl) getBlockMetadata(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
+func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
 	var blockMetadataId int64
 	err := tx.QueryRowContext(ctx, `
 		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
