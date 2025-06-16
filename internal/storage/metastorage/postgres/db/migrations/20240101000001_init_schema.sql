@@ -19,15 +19,12 @@ CREATE TABLE canonical_blocks (
     height BIGINT NOT NULL,
     block_metadata_id BIGINT NOT NULL,
     tag INT NOT NULL,
-    sequence_number BIGINT NOT NULL DEFAULT 0,
     -- Constraints
-    PRIMARY KEY (height, tag, sequence_number),
+    PRIMARY KEY (height, tag),
     UNIQUE (height, tag, block_metadata_id), -- Prevent same block from being canonical multiple times
     FOREIGN KEY (block_metadata_id) REFERENCES block_metadata(id) ON DELETE RESTRICT
 );
 
--- Supports: GetLatestBlock() - finds max sequence_number for a tag
-CREATE INDEX idx_canonical_sequence ON canonical_blocks (tag, sequence_number DESC);
 -- Supports: JOINs between canonical_blocks and block_metadata tables
 CREATE INDEX idx_canonical_block_metadata_fk ON canonical_blocks (block_metadata_id);
 
