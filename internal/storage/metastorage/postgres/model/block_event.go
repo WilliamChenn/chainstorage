@@ -6,8 +6,34 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-func BlockEventFromRow(row *sql.Row) error {
-	return nil
+func BlockEventFromRow(row *sql.Row) (*api.BlockchainEvent, error) {
+	var event api.BlockchainEvent
+	var eventTypeStr string
+	var blockHash string
+	var blockHeight uint64
+	var eventSequence int64
+	var eventTag uint32
+
+	err := row.Scan(
+		&eventSequence,
+		&eventTypeStr,
+		&blockHeight,
+		&blockHash,
+		&eventTag,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	event.Type = ParseEventType(eventTypeStr)
+	event.SequenceNum = eventSequence
+	event.EventTag = eventTag
+	event.Block = &api.BlockIdentifier{
+		Hash:   blockHash,
+		Height: blockHeight,
+	}
+
+	return &event, nil
 }
 
 // ParseEventType converts a string representation of event type to the protobuf enum

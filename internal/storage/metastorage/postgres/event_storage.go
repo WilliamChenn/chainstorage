@@ -84,10 +84,10 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			}
 			// Insert the event
 			_, err = tx.ExecContext(ctx, `
-				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height)
-				VALUES ($1, $2, $3, $4, $5)
+				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+				VALUES ($1, $2, $3, $4, $5, $6)
 				ON CONFLICT (event_tag, event_sequence) DO NOTHING
-			`, eventTag, eventEntry.EventId, pgmodel.EventTypeToString(eventEntry.EventType), blockMetadataId, eventEntry.BlockHeight)
+			`, eventTag, eventEntry.EventId, pgmodel.EventTypeToString(eventEntry.EventType), blockMetadataId, eventEntry.BlockHeight, eventEntry.BlockHash)
 			if err != nil {
 				return xerrors.Errorf("failed to insert event entry: %w", err)
 			}
@@ -103,7 +103,7 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 		var eventTypeStr string
 
 		err := e.db.QueryRowContext(ctx, `
-			SELECT be.event_sequence, be.event_type, bm.height, bm.hash, bm.tag, bm.parent_hash, 
+			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
 			JOIN block_metadata bm ON be.block_metadata_id = bm.id
@@ -135,7 +135,7 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
 	return e.instrumentGetEventsAfterEventId.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
-			SELECT be.event_sequence, be.event_type, bm.height, bm.hash, bm.tag, bm.parent_hash, 
+			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
 			JOIN block_metadata bm ON be.block_metadata_id = bm.id
@@ -156,7 +156,7 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag uint32, minEventId int64, maxEventId int64) ([]*model.EventEntry, error) {
 	return e.instrumentGetEventsByEventIdRange.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
-			SELECT be.event_sequence, be.event_type, bm.height, bm.hash, bm.tag, bm.parent_hash, 
+			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
 			JOIN block_metadata bm ON be.block_metadata_id = bm.id
@@ -197,7 +197,6 @@ func (e *eventStorageImpl) GetMaxEventId(ctx context.Context, eventTag uint32) (
 		return maxEventId.Int64, nil
 	})
 }
-
 
 // basically if we have events 1,2,3,4,5,6,7 and call SetMaxEventId(ctx, eventTag, 4), then we will delete all events after 4
 func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, maxEventId int64) error {
@@ -269,7 +268,7 @@ func (e *eventStorageImpl) GetFirstEventIdByBlockHeight(ctx context.Context, eve
 func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventEntry, error) {
 	return e.instrumentGetEventsByBlockHeight.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
-			SELECT be.event_sequence, be.event_type, bm.height, bm.hash, bm.tag, bm.parent_hash, 
+			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
 			JOIN block_metadata bm ON be.block_metadata_id = bm.id
@@ -302,11 +301,13 @@ func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, e
 		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
 	`, eventEntry.Tag, eventEntry.BlockHash).Scan(&blockMetadataId)
 
-	if err == nil {
-		return blockMetadataId, nil
-	} else {
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, xerrors.Errorf("block metadata not found for tag %d and hash %s", eventEntry.Tag, eventEntry.BlockHash)
+		}
 		return 0, xerrors.Errorf("failed to query block metadata: %w", err)
 	}
+	return blockMetadataId, nil
 }
 
 func (e *eventStorageImpl) scanEventEntries(rows *sql.Rows) ([]*model.EventEntry, error) {

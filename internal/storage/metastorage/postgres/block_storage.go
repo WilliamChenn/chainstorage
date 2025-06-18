@@ -51,6 +51,10 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 func (b *blockStorageImpl) PersistBlockMetas(
 	ctx context.Context, updateWatermark bool, blocks []*api.BlockMetadata, lastBlock *api.BlockMetadata) error {
 	return b.instrumentPersistBlockMetas.Instrument(ctx, func(ctx context.Context) error {
+		// `updateWatermark` is ignored in Postgres implementation because we can always find the latest
+		// block by querying the maximum height in canonical_blocks for a tag.
+		//For each new block we simply
+		// insert or update the canonical_blocks row at its height.
 		if len(blocks) == 0 {
 			return nil
 		}
@@ -126,10 +130,6 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			return xerrors.Errorf("failed to commit transaction: %w", err)
 		}
 		committed = true
-		// `updateWatermark` is ignored in Postgres implementation because we can always find the latest
-		// block by querying the maximum height in canonical_blocks for a tag.
-		//For each new block we simply
-		// insert or update the canonical_blocks row at its height.
 		return nil
 	})
 }
@@ -142,9 +142,11 @@ func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
-			WHERE cb.tag = $1`
+			WHERE cb.tag = $1
+			ORDER BY cb.height DESC
+			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag)
-		block, err := model.BlockMetadataFromCanonicalRow(row)
+		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, xerrors.Errorf("no latest block found: %w", errors.ErrItemNotFound)
@@ -160,14 +162,27 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 		if err := b.validateHeight(height); err != nil {
 			return nil, err
 		}
-		// Query block_metadata directly by hash (may not be canonical)
-		query := `
+		var query string
+		var row *sql.Row
+		if blockHash == "" {
+			query = `
+				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+				FROM canonical_blocks cb
+				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+				WHERE cb.tag = $1 AND cb.height = $2
+				ORDER BY cb.height DESC`
+			row = b.db.QueryRowContext(ctx, query, tag, height)
+		} else {
+			query = `
 			SELECT id, height, tag, hash, parent_hash, object_key_main, 
 			       EXTRACT(EPOCH FROM timestamp)::BIGINT, skipped
 			FROM block_metadata 
 			WHERE tag = $1 AND height = $2 AND hash = $3`
-		row := b.db.QueryRowContext(ctx, query, tag, height, blockHash)
-		block, err := model.BlockMetadataFromRow(row)
+			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
+		}
+		// Query block_metadata directly by hash (may not be canonical)
+		block, err := model.BlockMetadataFromRow(b.db, row)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, xerrors.Errorf("block not found: %w", errors.ErrItemNotFound)
@@ -192,7 +207,7 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 			WHERE cb.tag = $1 AND cb.height = $2
 			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag, height)
-		block, err := model.BlockMetadataFromCanonicalRow(row)
+		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, xerrors.Errorf("canonical block at height %d not found: %w", height, errors.ErrItemNotFound)
@@ -205,6 +220,9 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 
 func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) ([]*api.BlockMetadata, error) {
 	return b.instrumentGetBlocksByHeightRange.Instrument(ctx, func(ctx context.Context) ([]*api.BlockMetadata, error) {
+		if startHeight >= endHeight {
+            return nil, errors.ErrOutOfRange
+        }
 		if err := b.validateHeight(startHeight); err != nil {
 			return nil, err
 		}
@@ -222,7 +240,7 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		}
 		defer rows.Close()
 
-		blocks, err := model.BlockMetadataFromCanonicalRows(rows)
+		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to scan block rows: %w", err)
 		}
@@ -271,7 +289,7 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 		}
 		defer rows.Close()
 
-		blocks, err := model.BlockMetadataFromCanonicalRows(rows)
+		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to scan block rows: %w", err)
 		}

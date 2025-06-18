@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
@@ -23,10 +24,10 @@ func newTransactionStorage(db *sql.DB, params Params) (internal.TransactionStora
 
 func (t *transactionStorageImpl) AddTransactions(ctx context.Context, transaction []*model.Transaction, parallelism int) error {
 	// TODO: Implement transaction insertion
-	return nil
+	return errors.New("not implemented")
 }
 
 func (t *transactionStorageImpl) GetTransaction(ctx context.Context, tag uint32, transactionHash string) ([]*model.Transaction, error) {
 	// TODO: Implement get transaction
-	return nil, nil
+	return nil, errors.New("not implemented")
 }

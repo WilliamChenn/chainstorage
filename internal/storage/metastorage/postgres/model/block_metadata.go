@@ -7,18 +7,33 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-// getParentHeight calculates parent height from current height
-func getParentHeight(height uint64) uint64 {
-	if height == 0 {
-		return 0
+// getParentHeightFromHash looks up the parent height by finding the block with the given parent hash
+func getParentHeightFromHash(db *sql.DB, tag uint32, parentHash string, currentHeight uint64) (uint64, error) {
+	if parentHash == "" {
+		return 0, nil
 	}
-	return height - 1
+
+	query := `
+		SELECT height 
+		FROM block_metadata 
+		WHERE tag = $1 AND hash = $2`
+
+	var parentHeight uint64
+	err := db.QueryRow(query, tag, parentHash).Scan(&parentHeight)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// If parent not found, fall back to height - 1
+			return currentHeight - 1, nil
+		}
+		return 0, err
+	}
+	return parentHeight, nil
 }
 
 // BlockMetadataFromRow converts a postgres row into a BlockMetadata proto
 // Used for direct block_metadata table queries
 // Schema: id, height, tag, hash, parent_hash, object_key_main, timestamp, skipped
-func BlockMetadataFromRow(row *sql.Row) (*api.BlockMetadata, error) {
+func BlockMetadataFromRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
 	var id int64 // We get this but don't need it in the result
@@ -36,14 +51,17 @@ func BlockMetadataFromRow(row *sql.Row) (*api.BlockMetadata, error) {
 		return nil, err
 	}
 	block.Timestamp = utils.ToTimestamp(timestamp)
-	block.ParentHeight = getParentHeight(block.Height)
+	block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
+	if err != nil {
+		return nil, err
+	}
 	return &block, nil
 }
 
 // BlockMetadataFromCanonicalRow converts a postgres row from canonical join into a BlockMetadata proto
 // Used for queries that join canonical_blocks with block_metadata
 // Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, bm.timestamp, bm.skipped
-func BlockMetadataFromCanonicalRow(row *sql.Row) (*api.BlockMetadata, error) {
+func BlockMetadataFromCanonicalRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
 	var id int64 // block_metadata.id
@@ -61,13 +79,16 @@ func BlockMetadataFromCanonicalRow(row *sql.Row) (*api.BlockMetadata, error) {
 		return nil, err
 	}
 	block.Timestamp = utils.ToTimestamp(timestamp)
-	block.ParentHeight = getParentHeight(block.Height)
+	block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
+	if err != nil {
+		return nil, err
+	}
 	return &block, nil
 }
 
 // BlockMetadataFromRows converts multiple postgres rows into BlockMetadata protos
 // Used for direct block_metadata table queries
-func BlockMetadataFromRows(rows *sql.Rows) ([]*api.BlockMetadata, error) {
+func BlockMetadataFromRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMetadata, error) {
 	var blocks []*api.BlockMetadata
 	for rows.Next() {
 		var block api.BlockMetadata
@@ -87,7 +108,10 @@ func BlockMetadataFromRows(rows *sql.Rows) ([]*api.BlockMetadata, error) {
 			return nil, err
 		}
 		block.Timestamp = utils.ToTimestamp(timestamp)
-		block.ParentHeight = getParentHeight(block.Height)
+		block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
+		if err != nil {
+			return nil, err
+		}
 		blocks = append(blocks, &block)
 	}
 	return blocks, nil
@@ -95,7 +119,7 @@ func BlockMetadataFromRows(rows *sql.Rows) ([]*api.BlockMetadata, error) {
 
 // BlockMetadataFromCanonicalRows converts multiple postgres rows from canonical joins into BlockMetadata protos
 // Used for queries that join canonical_blocks with block_metadata
-func BlockMetadataFromCanonicalRows(rows *sql.Rows) ([]*api.BlockMetadata, error) {
+func BlockMetadataFromCanonicalRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMetadata, error) {
 	var blocks []*api.BlockMetadata
 	for rows.Next() {
 		var block api.BlockMetadata
@@ -115,7 +139,10 @@ func BlockMetadataFromCanonicalRows(rows *sql.Rows) ([]*api.BlockMetadata, error
 			return nil, err
 		}
 		block.Timestamp = utils.ToTimestamp(timestamp)
-		block.ParentHeight = getParentHeight(block.Height)
+		block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
+		if err != nil {
+			return nil, err
+		}
 		blocks = append(blocks, &block)
 	}
 	return blocks, nil
