@@ -102,13 +102,14 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
 		defer tx.Rollback()
-		//get or block_metadata entries for each event
+		//get or create block_metadata entries for each event
 		for _, eventEntry := range eventEntries {
-			blockMetadataId, err := e.getBlockMetadataId(ctx, tx, eventEntry)
+			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
 			if err != nil {
-				return xerrors.Errorf("failed to get block metadata: %w", err)
+				return xerrors.Errorf("failed to get or create block metadata: %w", err)
 			}
-			// Insert the event
+
+			// Insert the event with valid block_metadata_id (no more NULL handling)
 			_, err = tx.ExecContext(ctx, `
 				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
 				VALUES ($1, $2, $3, $4, $5, $6)
@@ -127,22 +128,27 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 	return e.instrumentGetEventByEventId.Instrument(ctx, func(ctx context.Context) (*model.EventEntry, error) {
 		var eventEntry model.EventEntry
 		var eventTypeStr string
+		var blockHash sql.NullString
+		var tag sql.NullInt32
+		var parentHash sql.NullString
+		var skipped sql.NullBool
+		var timestamp sql.NullInt64
 
 		err := e.db.QueryRowContext(ctx, `
-			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
-				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
+			SELECT be.event_sequence, be.event_type, be.height, be.hash, 
+				   bm.tag, bm.parent_hash, bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
-			JOIN block_metadata bm ON be.block_metadata_id = bm.id
+			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence = $2
 		`, eventTag, eventId).Scan(
 			&eventEntry.EventId,
 			&eventTypeStr,
 			&eventEntry.BlockHeight,
-			&eventEntry.BlockHash,
-			&eventEntry.Tag,
-			&eventEntry.ParentHash,
-			&eventEntry.BlockSkipped,
-			&eventEntry.BlockTimestamp,
+			&blockHash,
+			&tag,
+			&parentHash,
+			&skipped,
+			&timestamp,
 			&eventEntry.EventTag,
 		)
 
@@ -151,6 +157,33 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 				return nil, errors.ErrItemNotFound
 			}
 			return nil, xerrors.Errorf("failed to get event by event id: %w", err)
+		}
+
+		// Handle null values from LEFT JOIN
+		if blockHash.Valid {
+			eventEntry.BlockHash = blockHash.String
+		} else {
+			eventEntry.BlockHash = ""
+		}
+		if tag.Valid {
+			eventEntry.Tag = uint32(tag.Int32)
+		} else {
+			eventEntry.Tag = model.DefaultBlockTag
+		}
+		if parentHash.Valid {
+			eventEntry.ParentHash = parentHash.String
+		} else {
+			eventEntry.ParentHash = ""
+		}
+		if skipped.Valid {
+			eventEntry.BlockSkipped = skipped.Bool
+		} else {
+			eventEntry.BlockSkipped = false
+		}
+		if timestamp.Valid {
+			eventEntry.BlockTimestamp = timestamp.Int64
+		} else {
+			eventEntry.BlockTimestamp = 0
 		}
 
 		// switch to defaultTag is not set
@@ -169,7 +202,7 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
-			JOIN block_metadata bm ON be.block_metadata_id = bm.id
+			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence > $2
 			ORDER BY be.event_sequence ASC
 			LIMIT $3
@@ -190,7 +223,7 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
-			JOIN block_metadata bm ON be.block_metadata_id = bm.id
+			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence >= $2 AND be.event_sequence < $3
 			ORDER BY be.event_sequence ASC
 		`, eventTag, minEventId, maxEventId)
@@ -204,6 +237,7 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if err != nil {
 			return nil, err
 		}
+
 		// Validate that we have all events in the range
 		expectedCount := maxEventId - minEventId
 		if int64(len(events)) != expectedCount {
@@ -302,7 +336,7 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
 				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
 			FROM block_events be
-			JOIN block_metadata bm ON be.block_metadata_id = bm.id
+			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.height = $2
 			ORDER BY be.event_sequence ASC
 		`, eventTag, blockHeight)
@@ -326,12 +360,11 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 }
 
 // Helper functions
-func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
-	var blockMetadataId int64
-
-	// For skipped blocks, look up by tag and height since hash is empty
+func (e *eventStorageImpl) getOrCreateBlockMetadataId(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
+	// For skipped blocks, create or find block metadata with specific fields
 	if eventEntry.BlockSkipped {
-		// First try with the eventEntry.Tag
+		// Try to find existing block metadata for this skipped event
+		var blockMetadataId int64
 		err := tx.QueryRowContext(ctx, `
 			SELECT id FROM block_metadata WHERE tag = $1 AND height = $2 AND skipped = true
 		`, eventEntry.Tag, eventEntry.BlockHeight).Scan(&blockMetadataId)
@@ -349,15 +382,16 @@ func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, e
 			}
 		}
 
-		// If we get here, the block metadata was not found
+		// If block metadata not found for skipped event, create it
 		if err == sql.ErrNoRows {
-			return 0, xerrors.Errorf("block metadata not found for tag %d and height %d (skipped)", eventEntry.Tag, eventEntry.BlockHeight)
+			return e.createSkippedBlockMetadata(ctx, tx, eventEntry)
 		}
 		return 0, xerrors.Errorf("failed to query block metadata: %w", err)
 	}
 
 	// For non-skipped blocks, look up by tag and hash
 	// First try with the eventEntry.Tag
+	var blockMetadataId int64
 	err := tx.QueryRowContext(ctx, `
 		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
 	`, eventEntry.Tag, eventEntry.BlockHash).Scan(&blockMetadataId)
@@ -382,27 +416,75 @@ func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, e
 	return 0, xerrors.Errorf("failed to query block metadata: %w", err)
 }
 
+// createSkippedBlockMetadata creates a new block_metadata entry for a skipped block
+func (e *eventStorageImpl) createSkippedBlockMetadata(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
+	// Create block metadata for skipped block with NULL values as specified
+	var blockMetadataId int64
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
+		VALUES ($1, $2, NULL, NULL, NULL, $3, true)
+		RETURNING id
+	`, eventEntry.BlockHeight, eventEntry.Tag, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to create block metadata for skipped block: %w", err)
+	}
+
+	return blockMetadataId, nil
+}
+
 func (e *eventStorageImpl) scanEventEntries(rows *sql.Rows) ([]*model.EventEntry, error) {
 	var events []*model.EventEntry
 
 	for rows.Next() {
 		var eventEntry model.EventEntry
 		var eventTypeStr string
+		var blockHash sql.NullString
+		var tag sql.NullInt32
+		var parentHash sql.NullString
+		var skipped sql.NullBool
+		var timestamp sql.NullInt64
 
 		err := rows.Scan(
 			&eventEntry.EventId,
 			&eventTypeStr,
 			&eventEntry.BlockHeight,
-			&eventEntry.BlockHash,
-			&eventEntry.Tag,
-			&eventEntry.ParentHash,
-			&eventEntry.BlockSkipped,
-			&eventEntry.BlockTimestamp,
+			&blockHash,
+			&tag,
+			&parentHash,
+			&skipped,
+			&timestamp,
 			&eventEntry.EventTag,
 		)
 
 		if err != nil {
 			return nil, xerrors.Errorf("failed to scan event entry: %w", err)
+		}
+
+		// Handle null values from LEFT JOIN
+		if blockHash.Valid {
+			eventEntry.BlockHash = blockHash.String
+		} else {
+			eventEntry.BlockHash = ""
+		}
+		if tag.Valid {
+			eventEntry.Tag = uint32(tag.Int32)
+		} else {
+			eventEntry.Tag = model.DefaultBlockTag
+		}
+		if parentHash.Valid {
+			eventEntry.ParentHash = parentHash.String
+		} else {
+			eventEntry.ParentHash = ""
+		}
+		if skipped.Valid {
+			eventEntry.BlockSkipped = skipped.Bool
+		} else {
+			eventEntry.BlockSkipped = false
+		}
+		if timestamp.Valid {
+			eventEntry.BlockTimestamp = timestamp.Int64
+		} else {
+			eventEntry.BlockTimestamp = 0
 		}
 
 		// switch to defaultTag is not set

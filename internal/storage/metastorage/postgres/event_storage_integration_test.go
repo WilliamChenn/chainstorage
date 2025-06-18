@@ -295,6 +295,175 @@ func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_NotSkipped() {
 	require.NoError(err)
 }
 
+func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_Skipped() {
+	require := testutil.Require(s.T())
+	numEvents := uint64(100)
+	ctx := context.TODO()
+
+	// Use the helper method to create initial events
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+
+	// Create block metadata ONLY for non-skipped heights
+	// Heights 101, 102, 106, 107, 108, 109 will have block metadata (non-skipped)
+	// Heights 100, 103, 104, 105 will be skipped (automatically created as skipped)
+	nonSkippedBlockMetas := []*api.BlockMetadata{
+		testutil.MakeBlockMetadata(numEvents+1, s.tag), // height 101
+		testutil.MakeBlockMetadata(numEvents+2, s.tag), // height 102
+		testutil.MakeBlockMetadata(numEvents+6, s.tag), // height 106
+		testutil.MakeBlockMetadata(numEvents+7, s.tag), // height 107
+		testutil.MakeBlockMetadata(numEvents+8, s.tag), // height 108
+		testutil.MakeBlockMetadata(numEvents+9, s.tag), // height 109
+	}
+
+	// Set proper parent relationships for blocks that come after gaps
+	// Block 106 should point to block 102 (since 103, 104, 105 are skipped/missing)
+	nonSkippedBlockMetas[2].ParentHeight = nonSkippedBlockMetas[1].Height // 106 -> 102
+	nonSkippedBlockMetas[2].ParentHash = nonSkippedBlockMetas[1].Hash
+
+	// Block 107 should point to block 106
+	nonSkippedBlockMetas[3].ParentHeight = nonSkippedBlockMetas[2].Height // 107 -> 106
+	nonSkippedBlockMetas[3].ParentHash = nonSkippedBlockMetas[2].Hash
+
+	// Block 108 should point to block 107
+	nonSkippedBlockMetas[4].ParentHeight = nonSkippedBlockMetas[3].Height // 108 -> 107
+	nonSkippedBlockMetas[4].ParentHash = nonSkippedBlockMetas[3].Hash
+
+	// Block 109 should point to block 108
+	nonSkippedBlockMetas[5].ParentHeight = nonSkippedBlockMetas[4].Height // 109 -> 108
+	nonSkippedBlockMetas[5].ParentHash = nonSkippedBlockMetas[4].Hash
+
+	err := s.accessor.PersistBlockMetas(ctx, true, nonSkippedBlockMetas, nil)
+	require.NoError(err)
+
+	// Test case: chain normal growing case, [+0(skipped), +1]
+	// Height 100 is skipped, height 101 is normal
+	blockEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents, numEvents+1, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+1, numEvents+2, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Test case: chain normal growing case, +0(skipped), +1, [+2, +3(skipped)]
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+2, numEvents+3, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+3, numEvents+4, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Test case: chain normal growing case, +0(skipped), +1, +2, +3(skipped), [+4(skipped), +5(skipped)]
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+4, numEvents+5, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+5, numEvents+6, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Test case: rollback case, +6, +7, +8(skipped), [-8(skipped), -7]
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+6, numEvents+8, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+8, numEvents+9, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+8, numEvents+9, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+7, numEvents+8, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Test case: rollback case, +7(skipped), +8, [-8, -7(skipped)]
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+7, numEvents+8, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+8, numEvents+9, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+8, numEvents+9, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+7, numEvents+8, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Test case: rollback case, +7(skipped), +8(skipped), [-8(skipped), -7(skipped)]
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+7, numEvents+8, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+8, numEvents+9, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+8, numEvents+9, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents+7, numEvents+8, s.tag, testutil.WithBlockSkipped())
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	// Verify that skipped blocks created block_metadata entries but not canonical_blocks entries
+	s.verifySkippedBlockHandling(ctx, numEvents, s.tag)
+}
+
+// verifySkippedBlockHandling verifies that skipped blocks have block_metadata entries but not canonical_blocks entries
+func (s *eventStorageTestSuite) verifySkippedBlockHandling(ctx context.Context, numEvents uint64, tag uint32) {
+	require := testutil.Require(s.T())
+
+	// Check that skipped heights have block_metadata entries with skipped=true
+	skippedHeights := []uint64{numEvents, numEvents + 3, numEvents + 4, numEvents + 5}
+	for _, height := range skippedHeights {
+		var count int
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM block_metadata 
+			WHERE tag = $1 AND height = $2 AND skipped = true AND hash IS NULL
+		`, tag, height).Scan(&count)
+		require.NoError(err)
+		require.Greater(count, 0, "Expected skipped block metadata for height %d", height)
+
+		// Verify that skipped blocks do NOT have canonical_blocks entries
+		err = s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM canonical_blocks 
+			WHERE tag = $1 AND height = $2
+		`, tag, height).Scan(&count)
+		require.NoError(err)
+		require.Equal(0, count, "Skipped blocks should not have canonical entries for height %d", height)
+	}
+
+	// Check that non-skipped heights have both block_metadata and canonical_blocks entries
+	nonSkippedHeights := []uint64{numEvents + 1, numEvents + 2, numEvents + 6, numEvents + 7, numEvents + 8, numEvents + 9}
+	for _, height := range nonSkippedHeights {
+		var count int
+		// Should have block_metadata entry with skipped=false
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM block_metadata 
+			WHERE tag = $1 AND height = $2 AND skipped = false AND hash IS NOT NULL
+		`, tag, height).Scan(&count)
+		require.NoError(err)
+		require.Greater(count, 0, "Expected non-skipped block metadata for height %d", height)
+
+		// Should have canonical_blocks entry
+		err = s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM canonical_blocks 
+			WHERE tag = $1 AND height = $2
+		`, tag, height).Scan(&count)
+		require.NoError(err)
+		require.Greater(count, 0, "Expected canonical entry for non-skipped height %d", height)
+	}
+}
+
 ////////////////////////////////////////////////////////////
 
 func (s *eventStorageTestSuite) TestGetFirstEventIdByBlockHeight() {

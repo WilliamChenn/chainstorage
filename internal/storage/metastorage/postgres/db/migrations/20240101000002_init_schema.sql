@@ -4,7 +4,7 @@ CREATE TABLE block_metadata (
     id BIGSERIAL PRIMARY KEY, -- for canonical_blocks and event fk reference
     height BIGINT NOT NULL,
     tag INT NOT NULL,
-    hash VARCHAR(66) NOT NULL, -- can hold a "0x"+64-hex string
+    hash VARCHAR(66), -- can hold a "0x"+64-hex string
     parent_hash VARCHAR(66),
     object_key_main VARCHAR(255),
     timestamp TIMESTAMPTZ NOT NULL,
@@ -35,9 +35,9 @@ CREATE TABLE block_events (
     event_tag INT NOT NULL DEFAULT 0, -- version
     event_sequence BIGINT NOT NULL, -- monotonically-increasing per tag
     event_type event_type_enum NOT NULL,
-    block_metadata_id BIGINT NOT NULL, -- fk referencing block_metadata
+    block_metadata_id BIGINT NOT NULL, -- fk referencing block_metadata 
     height BIGINT NOT NULL,
-    hash VARCHAR(66) NOT NULL,
+    hash VARCHAR(66),
     -- Constraints
     PRIMARY KEY (event_tag, event_sequence),
     FOREIGN KEY (block_metadata_id) REFERENCES block_metadata(id) ON DELETE RESTRICT
