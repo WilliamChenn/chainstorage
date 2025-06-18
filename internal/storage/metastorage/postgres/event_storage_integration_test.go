@@ -256,7 +256,7 @@ func (s *eventStorageTestSuite) TestAddEventsMultipleTimesNonDefaultEventTag() {
 func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_NotSkipped() {
 	require := testutil.Require(s.T())
 	numEvents := uint64(100)
-	
+
 	// First, add block metadata for the initial events
 	blockMetas := testutil.MakeBlockMetadatasFromStartHeight(0, int(numEvents), s.tag)
 	ctx := context.TODO()
@@ -293,6 +293,125 @@ func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_NotSkipped() {
 	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents, numEvents+7, s.tag)
 	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
 	require.NoError(err)
+}
+
+////////////////////////////////////////////////////////////
+
+func (s *eventStorageTestSuite) TestGetFirstEventIdByBlockHeight() {
+	require := testutil.Require(s.T())
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+
+	// add the remove events again so for each height, there should be two events
+	for i := int64(numEvents - 1); i >= 0; i-- {
+		// Add block metadata for the removal event
+		blockMetas := testutil.MakeBlockMetadatasFromStartHeight(uint64(i), 1, s.tag)
+		ctx := context.TODO()
+		err := s.accessor.PersistBlockMetas(ctx, true, blockMetas, nil)
+		if err != nil {
+			panic(err)
+		}
+
+		removeEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, uint64(i), uint64(i+1), s.tag)
+		err = s.accessor.AddEvents(ctx, s.eventTag, removeEvents)
+		if err != nil {
+			panic(err)
+		}
+		eventId, err := s.accessor.GetFirstEventIdByBlockHeight(ctx, s.eventTag, uint64(i))
+		if err != nil {
+			panic(err)
+		}
+		require.Equal(i+model.EventIdStartValue, eventId)
+	}
+}
+
+func (s *eventStorageTestSuite) TestGetFirstEventIdByBlockHeightNonDefaultEventTag() {
+	require := testutil.Require(s.T())
+	numEvents := uint64(100)
+	eventTag := uint32(1)
+	ctx := context.TODO()
+	s.addEvents(eventTag, 0, numEvents, s.tag)
+
+	// fetch event for blockHeight=0
+	eventId, err := s.accessor.GetFirstEventIdByBlockHeight(ctx, eventTag, uint64(0))
+	require.NoError(err)
+	require.Equal(eventId, model.EventIdStartValue)
+
+	// add the remove events again so for each height, there should be two events
+	for i := int64(numEvents - 1); i >= 0; i-- {
+		// Add block metadata for the removal event
+		blockMetas := testutil.MakeBlockMetadatasFromStartHeight(uint64(i), 1, s.tag)
+		err := s.accessor.PersistBlockMetas(ctx, true, blockMetas, nil)
+		require.NoError(err)
+
+		removeEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, uint64(i), uint64(i+1), s.tag)
+		err = s.accessor.AddEvents(ctx, eventTag, removeEvents)
+		require.NoError(err)
+		eventId, err := s.accessor.GetFirstEventIdByBlockHeight(ctx, eventTag, uint64(i))
+		require.NoError(err)
+		require.Equal(i+model.EventIdStartValue, eventId)
+	}
+}
+
+func (s *eventStorageTestSuite) TestGetEventByEventId() {
+	const (
+		eventId   = int64(10)
+		numEvents = uint64(20)
+	)
+
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+
+	event, err := s.accessor.GetEventByEventId(ctx, s.eventTag, eventId)
+	require.NoError(err)
+	require.Equal(event.EventId, eventId)
+	require.Equal(event.BlockHeight, uint64(eventId-1))
+}
+
+func (s *eventStorageTestSuite) TestGetEventByEventId_InvalidEventId() {
+	const (
+		eventId   = int64(30)
+		numEvents = uint64(20)
+	)
+
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+
+	_, err := s.accessor.GetEventByEventId(ctx, s.eventTag, eventId)
+	require.Error(err)
+}
+
+func (s *eventStorageTestSuite) TestGetEventsByBlockHeight() {
+	const (
+		blockHeight = uint64(19)
+		numEvents   = uint64(20)
+	)
+
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	// +0, +1, ..., +19, -19,
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+
+	// Add block metadata for the removal event
+	blockMetas := testutil.MakeBlockMetadatasFromStartHeight(numEvents-1, 1, s.tag)
+	err := s.accessor.PersistBlockMetas(ctx, true, blockMetas, nil)
+	require.NoError(err)
+
+	blockEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_REMOVED, numEvents-1, numEvents, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+
+	events, err := s.accessor.GetEventsByBlockHeight(ctx, s.eventTag, blockHeight)
+	require.NoError(err)
+	require.Equal(2, len(events))
+	for _, event := range events {
+		require.Equal(blockHeight, event.BlockHeight)
+	}
 }
 
 func TestIntegrationEventStorageTestSuite(t *testing.T) {

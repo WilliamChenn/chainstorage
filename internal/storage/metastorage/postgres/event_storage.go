@@ -329,6 +329,34 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
 	var blockMetadataId int64
 
+	// For skipped blocks, look up by tag and height since hash is empty
+	if eventEntry.BlockSkipped {
+		// First try with the eventEntry.Tag
+		err := tx.QueryRowContext(ctx, `
+			SELECT id FROM block_metadata WHERE tag = $1 AND height = $2 AND skipped = true
+		`, eventEntry.Tag, eventEntry.BlockHeight).Scan(&blockMetadataId)
+		if err == nil {
+			return blockMetadataId, nil
+		}
+		// If not found and eventEntry.Tag is DefaultBlockTag, try with tag = 0
+		if err == sql.ErrNoRows && eventEntry.Tag == model.DefaultBlockTag {
+			err = tx.QueryRowContext(ctx, `
+				SELECT id FROM block_metadata WHERE tag = $1 AND height = $2 AND skipped = true
+			`, uint32(0), eventEntry.BlockHeight).Scan(&blockMetadataId)
+
+			if err == nil {
+				return blockMetadataId, nil
+			}
+		}
+
+		// If we get here, the block metadata was not found
+		if err == sql.ErrNoRows {
+			return 0, xerrors.Errorf("block metadata not found for tag %d and height %d (skipped)", eventEntry.Tag, eventEntry.BlockHeight)
+		}
+		return 0, xerrors.Errorf("failed to query block metadata: %w", err)
+	}
+
+	// For non-skipped blocks, look up by tag and hash
 	// First try with the eventEntry.Tag
 	err := tx.QueryRowContext(ctx, `
 		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
