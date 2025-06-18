@@ -127,6 +127,11 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 			return nil, xerrors.Errorf("failed to get event by event id: %w", err)
 		}
 
+		// switch to defaultTag is not set
+		if eventEntry.Tag == 0 {
+			eventEntry.Tag = model.DefaultBlockTag
+		}
+
 		eventEntry.EventType = pgmodel.ParseEventType(eventTypeStr)
 		return &eventEntry, nil
 	})
@@ -297,17 +302,30 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 // Helper functions
 func (e *eventStorageImpl) getBlockMetadataId(ctx context.Context, tx *sql.Tx, eventEntry *model.EventEntry) (int64, error) {
 	var blockMetadataId int64
+
+	// First try with the eventEntry.Tag
 	err := tx.QueryRowContext(ctx, `
 		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
 	`, eventEntry.Tag, eventEntry.BlockHash).Scan(&blockMetadataId)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return 0, xerrors.Errorf("block metadata not found for tag %d and hash %s", eventEntry.Tag, eventEntry.BlockHash)
-		}
-		return 0, xerrors.Errorf("failed to query block metadata: %w", err)
+	if err == nil {
+		return blockMetadataId, nil
 	}
-	return blockMetadataId, nil
+	// If not found and eventEntry.Tag is DefaultBlockTag, try with tag = 0
+	if err == sql.ErrNoRows && eventEntry.Tag == model.DefaultBlockTag {
+		err = tx.QueryRowContext(ctx, `
+			SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
+		`, uint32(0), eventEntry.BlockHash).Scan(&blockMetadataId)
+
+		if err == nil {
+			return blockMetadataId, nil
+		}
+	}
+
+	// If we get here, the block metadata was not found
+	if err == sql.ErrNoRows {
+		return 0, xerrors.Errorf("block metadata not found for tag %d and hash %s", eventEntry.Tag, eventEntry.BlockHash)
+	}
+	return 0, xerrors.Errorf("failed to query block metadata: %w", err)
 }
 
 func (e *eventStorageImpl) scanEventEntries(rows *sql.Rows) ([]*model.EventEntry, error) {
@@ -331,6 +349,11 @@ func (e *eventStorageImpl) scanEventEntries(rows *sql.Rows) ([]*model.EventEntry
 
 		if err != nil {
 			return nil, xerrors.Errorf("failed to scan event entry: %w", err)
+		}
+
+		// switch to defaultTag is not set
+		if eventEntry.Tag == 0 {
+			eventEntry.Tag = model.DefaultBlockTag
 		}
 
 		eventEntry.EventType = pgmodel.ParseEventType(eventTypeStr)

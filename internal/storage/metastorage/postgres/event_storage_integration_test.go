@@ -207,6 +207,7 @@ func (s *eventStorageTestSuite) TestSetMaxEventIdNonDefaultEventTag() {
 	require.Error(err)
 	require.Equal(errors.ErrNoEventHistory, err)
 }
+////////////////////////////////////////////////////////////
 
 func (s *eventStorageTestSuite) TestAddEvents() {
 	numEvents := uint64(100)
@@ -214,12 +215,18 @@ func (s *eventStorageTestSuite) TestAddEvents() {
 	s.verifyEvents(s.eventTag, numEvents, s.tag)
 }
 
-
 func (s *eventStorageTestSuite) TestAddEventsNonDefaultEventTag() {
 	numEvents := uint64(100)
 	s.addEvents(uint32(1), 0, numEvents, s.tag)
 	s.verifyEvents(uint32(1), numEvents, s.tag)
 }
+
+func (s *eventStorageTestSuite) TestAddEventsDefaultTag() {
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, 0)
+	s.verifyEvents(s.eventTag, numEvents, model.DefaultBlockTag)
+}
+
 
 func TestIntegrationEventStorageTestSuite(t *testing.T) {
 	require := testutil.Require(t)
