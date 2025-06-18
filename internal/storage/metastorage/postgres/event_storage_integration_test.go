@@ -136,10 +136,89 @@ func (s *eventStorageTestSuite) verifyEvents(eventTag uint32, numEvents uint64, 
 		}
 	}
 }
+
+func (s *eventStorageTestSuite) TestSetMaxEventId() {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+	watermark, err := s.accessor.GetMaxEventId(ctx, s.eventTag)
+	require.NoError(err)
+	require.Equal(model.EventIdStartValue+int64(numEvents-1), watermark)
+
+	// reset it to a new value
+	newEventId := int64(5)
+	err = s.accessor.SetMaxEventId(ctx, s.eventTag, newEventId)
+	require.NoError(err)
+	watermark, err = s.accessor.GetMaxEventId(ctx, s.eventTag)
+	require.NoError(err)
+	require.Equal(watermark, newEventId)
+
+	// reset it to invalid value
+	invalidEventId := int64(-1)
+	err = s.accessor.SetMaxEventId(ctx, s.eventTag, invalidEventId)
+	require.Error(err)
+
+	// reset it to value bigger than current max
+	invalidEventId = newEventId + 10
+	err = s.accessor.SetMaxEventId(ctx, s.eventTag, invalidEventId)
+	require.Error(err)
+
+	// reset it to EventIdDeleted
+	err = s.accessor.SetMaxEventId(ctx, s.eventTag, model.EventIdDeleted)
+	require.NoError(err)
+	_, err = s.accessor.GetMaxEventId(ctx, s.eventTag)
+	require.Error(err)
+	require.Equal(errors.ErrNoEventHistory, err)
+}
+
+func (s *eventStorageTestSuite) TestSetMaxEventIdNonDefaultEventTag() {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+	numEvents := uint64(100)
+	eventTag := uint32(1)
+	s.addEvents(eventTag, 0, numEvents, s.tag)
+	watermark, err := s.accessor.GetMaxEventId(ctx, eventTag)
+	require.NoError(err)
+	require.Equal(model.EventIdStartValue+int64(numEvents-1), watermark)
+
+	// reset it to a new value
+	newEventId := int64(5)
+	err = s.accessor.SetMaxEventId(ctx, eventTag, newEventId)
+	require.NoError(err)
+	watermark, err = s.accessor.GetMaxEventId(ctx, eventTag)
+	require.NoError(err)
+	require.Equal(watermark, newEventId)
+
+	// reset it to invalid value
+	invalidEventId := int64(-1)
+	err = s.accessor.SetMaxEventId(ctx, eventTag, invalidEventId)
+	require.Error(err)
+
+	// reset it to value bigger than current max
+	invalidEventId = newEventId + 10
+	err = s.accessor.SetMaxEventId(ctx, eventTag, invalidEventId)
+	require.Error(err)
+
+	// reset it to EventIdDeleted
+	err = s.accessor.SetMaxEventId(ctx, eventTag, model.EventIdDeleted)
+	require.NoError(err)
+	_, err = s.accessor.GetMaxEventId(ctx, eventTag)
+	require.Error(err)
+	require.Equal(errors.ErrNoEventHistory, err)
+}
+
 func (s *eventStorageTestSuite) TestAddEvents() {
 	numEvents := uint64(100)
 	s.addEvents(s.eventTag, 0, numEvents, s.tag)
 	s.verifyEvents(s.eventTag, numEvents, s.tag)
+}
+
+
+func (s *eventStorageTestSuite) TestAddEventsNonDefaultEventTag() {
+	numEvents := uint64(100)
+	s.addEvents(uint32(1), 0, numEvents, s.tag)
+	s.verifyEvents(uint32(1), numEvents, s.tag)
 }
 
 func TestIntegrationEventStorageTestSuite(t *testing.T) {
