@@ -13,6 +13,10 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 )
 
+const (
+	addEventsSafePadding = int64(20)
+)
+
 type (
 	eventStorageImpl struct {
 		db                                     *sql.DB
@@ -71,6 +75,28 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		return nil
 	}
 	return e.instrumentAddEvents.Instrument(ctx, func(ctx context.Context) error {
+		startEventId := eventEntries[0].EventId
+		var eventsToValidate []*model.EventEntry
+		// fetch some events before startEventId
+		startFetchId := startEventId - addEventsSafePadding
+		if startFetchId < model.EventIdStartValue {
+			startFetchId = model.EventIdStartValue
+		}
+		if startFetchId < startEventId {
+			beforeEvents, err := e.GetEventsByEventIdRange(ctx, eventTag, startFetchId, startEventId)
+			if err != nil {
+				return xerrors.Errorf("failed to fetch events: %w", err)
+			}
+			eventsToValidate = append(beforeEvents, eventEntries...)
+		} else {
+			eventsToValidate = eventEntries
+		}
+
+		err := internal.ValidateEvents(eventsToValidate)
+		if err != nil {
+			return xerrors.Errorf("events failed validation: %w", err)
+		}
+
 		tx, err := e.db.BeginTx(ctx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)

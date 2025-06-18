@@ -207,6 +207,7 @@ func (s *eventStorageTestSuite) TestSetMaxEventIdNonDefaultEventTag() {
 	require.Error(err)
 	require.Equal(errors.ErrNoEventHistory, err)
 }
+
 ////////////////////////////////////////////////////////////
 
 func (s *eventStorageTestSuite) TestAddEvents() {
@@ -227,6 +228,72 @@ func (s *eventStorageTestSuite) TestAddEventsDefaultTag() {
 	s.verifyEvents(s.eventTag, numEvents, model.DefaultBlockTag)
 }
 
+func (s *eventStorageTestSuite) TestAddEventsNonDefaultTag() {
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, 2)
+	s.verifyEvents(s.eventTag, numEvents, 2)
+}
+
+func (s *eventStorageTestSuite) TestAddEventsMultipleTimes() {
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+	s.addEvents(s.eventTag, numEvents, numEvents, s.tag)
+	numEvents = numEvents * 2
+	s.verifyEvents(s.eventTag, numEvents, s.tag)
+}
+
+func (s *eventStorageTestSuite) TestAddEventsMultipleTimesNonDefaultEventTag() {
+	numEvents := uint64(100)
+	eventTag := uint32(1)
+	s.addEvents(eventTag, 0, numEvents, s.tag)
+	s.addEvents(eventTag, numEvents, numEvents, s.tag)
+	numEvents = numEvents * 2
+	s.verifyEvents(eventTag, numEvents, s.tag)
+}
+
+////////////////////////////////////////////////////////////
+
+func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_NotSkipped() {
+	require := testutil.Require(s.T())
+	numEvents := uint64(100)
+	
+	// First, add block metadata for the initial events
+	blockMetas := testutil.MakeBlockMetadatasFromStartHeight(0, int(numEvents), s.tag)
+	ctx := context.TODO()
+	err := s.accessor.PersistBlockMetas(ctx, true, blockMetas, nil)
+	require.NoError(err)
+
+	blockEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, 0, numEvents, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	if err != nil {
+		panic(err)
+	}
+
+	// Add block metadata for the additional events that will be tested
+	additionalBlockMetas := testutil.MakeBlockMetadatasFromStartHeight(numEvents, 10, s.tag)
+	err = s.accessor.PersistBlockMetas(ctx, true, additionalBlockMetas, nil)
+	require.NoError(err)
+
+	// have add event for height numEvents-1 again, invalid
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents-1, numEvents+4, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.Error(err)
+
+	// missing event for height numEvents, invalid
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+2, numEvents+7, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.Error(err)
+
+	// hash mismatch, invalid
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents+2, numEvents+7, s.tag, testutil.WithBlockHashFormat("HashMismatch0x%s"))
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.Error(err)
+
+	// continuous, should be able to add them
+	blockEvents = testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, numEvents, numEvents+7, s.tag)
+	err = s.accessor.AddEvents(ctx, s.eventTag, blockEvents)
+	require.NoError(err)
+}
 
 func TestIntegrationEventStorageTestSuite(t *testing.T) {
 	require := testutil.Require(t)
