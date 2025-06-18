@@ -3,15 +3,20 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
+	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 type eventStorageTestSuite struct {
@@ -47,6 +52,96 @@ func (s *eventStorageTestSuite) SetupTest() {
 	s.db = db
 }
 
+func (s *eventStorageTestSuite) TearDownTest() {
+	if s.db != nil {
+		ctx := context.Background()
+		s.T().Log("Clearing database tables after test")
+		// Clear all tables in reverse order due to foreign key constraints
+		tables := []string{"transactions", "block_events", "canonical_blocks", "block_metadata"}
+		for _, table := range tables {
+			_, err := s.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
+			if err != nil {
+				s.T().Logf("Failed to clear table %s: %v", table, err)
+			}
+		}
+	}
+}
+
+func (s *eventStorageTestSuite) TearDownSuite() {
+	if s.db != nil {
+		s.db.Close()
+	}
+}
+func (s *eventStorageTestSuite) addEvents(eventTag uint32, startHeight uint64, numEvents uint64, tag uint32) {
+	// First, add block metadata for the events
+	blockMetas := testutil.MakeBlockMetadatasFromStartHeight(startHeight, int(numEvents), tag)
+	ctx := context.TODO()
+	err := s.accessor.PersistBlockMetas(ctx, true, blockMetas, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// Then add events
+	blockEvents := testutil.MakeBlockEvents(api.BlockchainEvent_BLOCK_ADDED, startHeight, startHeight+numEvents, tag)
+	err = s.accessor.AddEvents(ctx, eventTag, blockEvents)
+	if err != nil {
+		panic(err)
+	}
+}
+func (s *eventStorageTestSuite) verifyEvents(eventTag uint32, numEvents uint64, tag uint32) {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	watermark, err := s.accessor.GetMaxEventId(ctx, eventTag)
+	if err != nil {
+		panic(err)
+	}
+	require.Equal(watermark-model.EventIdStartValue, int64(numEvents-1))
+
+	// fetch range with missing item
+	_, err = s.accessor.GetEventsByEventIdRange(ctx, eventTag, model.EventIdStartValue, model.EventIdStartValue+int64(numEvents+100))
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+
+	// fetch valid range
+	fetchedEvents, err := s.accessor.GetEventsByEventIdRange(ctx, eventTag, model.EventIdStartValue, model.EventIdStartValue+int64(numEvents))
+	if err != nil {
+		panic(err)
+	}
+	require.NotNil(fetchedEvents)
+	require.Equal(uint64(len(fetchedEvents)), numEvents)
+
+	numFollowingEventsToFetch := uint64(10)
+	for i, event := range fetchedEvents {
+		require.Equal(int64(i)+model.EventIdStartValue, event.EventId)
+		require.Equal(uint64(i), event.BlockHeight)
+		require.Equal(api.BlockchainEvent_BLOCK_ADDED, event.EventType)
+		require.Equal(tag, event.Tag)
+		require.Equal(eventTag, event.EventTag)
+
+		expectedNumEvents := numFollowingEventsToFetch
+		if uint64(event.EventId)+numFollowingEventsToFetch >= numEvents {
+			expectedNumEvents = numEvents - 1 - uint64(event.EventId-model.EventIdStartValue)
+		}
+		followingEvents, err := s.accessor.GetEventsAfterEventId(ctx, eventTag, event.EventId, numFollowingEventsToFetch)
+		if err != nil {
+			panic(err)
+		}
+		require.Equal(uint64(len(followingEvents)), expectedNumEvents)
+		for j, followingEvent := range followingEvents {
+			require.Equal(int64(i+j+1)+model.EventIdStartValue, followingEvent.EventId)
+			require.Equal(uint64(i+j+1), followingEvent.BlockHeight)
+			require.Equal(api.BlockchainEvent_BLOCK_ADDED, followingEvent.EventType)
+			require.Equal(eventTag, followingEvent.EventTag)
+		}
+	}
+}
+func (s *eventStorageTestSuite) TestAddEvents() {
+	numEvents := uint64(100)
+	s.addEvents(s.eventTag, 0, numEvents, s.tag)
+	s.verifyEvents(s.eventTag, numEvents, s.tag)
+}
+
 func TestIntegrationEventStorageTestSuite(t *testing.T) {
 	require := testutil.Require(t)
 	// Test with eth-mainnet for stream version
@@ -54,4 +149,3 @@ func TestIntegrationEventStorageTestSuite(t *testing.T) {
 	require.NoError(err)
 	suite.Run(t, &eventStorageTestSuite{config: cfg})
 }
-
